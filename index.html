@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>AreiaControl</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192x192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192x192.png">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { background: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow-x: hidden; color: #f1f5f9; }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #1e293b; } ::-webkit-scrollbar-thumb { background: #475569; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── STORAGE ──────────────────────────────────────────────────────────────────
+const STORAGE_KEY = "areiacontrol-v6";
+
+const DEFAULT_DATA = {
+  produtos: [
+    { id: "p1", nome: "Areia Fina", fator: 1.4 },
+    { id: "p2", nome: "Areia Grossa", fator: 1.5 },
+    { id: "p3", nome: "Brita", fator: 1.6 },
+    { id: "p4", nome: "Pedrisco", fator: 1.5 },
+  ],
+  clientes: [],
+  entradas: [],
+  vendas: [],
+};
+
+function loadData() {
+  try {
+    const s = localStorage.getItem(STORAGE_KEY);
+    if (s) return { ...DEFAULT_DATA, ...JSON.parse(s) };
+  } catch (e) {}
+  return DEFAULT_DATA;
+}
+
+function saveData(d) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch (e) {}
+}
+
+// ─── VOICE PARSER ─────────────────────────────────────────────────────────────
+function parseVoice(transcript, data) {
+  const t = transcript.toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ").trim();
+
+  // Extract all numbers (including decimals with comma or dot)
+  const nums = [];
+  const numMatches = t.match(/\d+[,.]?\d*/g) || [];
+  numMatches.forEach(m => nums.push(parseFloat(m.replace(",", "."))));
+
+  // Smarter extraction: find number explicitly before/after "toneladas" or "ton"
+  // e.g. "brita 1 10 toneladas 1320" → toneladas=10, custo=1320
+  const matchTon = t.match(/(\d+[,.]?\d*)\s*(?:toneladas?|ton\b)/);
+  const matchApos = t.match(/(?:toneladas?|ton\b)\s*(?:de\s+)?(\d+[,.]?\d*)/);
+  const tonFromText = matchTon
+    ? parseFloat(matchTon[1].replace(",", "."))
+    : matchApos ? parseFloat(matchApos[1].replace(",", ".")) : null;
+
+  // Find produto — remove product-type suffixes like "brita 1" before extracting numbers
+  let produtoMatch = null;
+  for (const p of data.produtos) {
+    const pNorm = p.nome.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (t.includes(pNorm)) { produtoMatch = p; break; }
+    const words = pNorm.split(" ");
+    if (words.every(w => t.includes(w))) { produtoMatch = p; break; }
+  }
+  // Aliases
+  if (!produtoMatch) {
+    if (t.includes("areia") && (t.includes("fina") || t.includes("fono"))) produtoMatch = data.produtos.find(p => p.nome === "Areia Fina");
+    else if (t.includes("areia") && (t.includes("grossa") || t.includes("gros"))) produtoMatch = data.produtos.find(p => p.nome === "Areia Grossa");
+    else if (t.includes("areia") && (t.includes("media") || t.includes("medio"))) produtoMatch = data.produtos.find(p => /media|medio/i.test(p.nome));
+    else if (t.includes("brita")) produtoMatch = data.produtos.find(p => p.nome.toLowerCase().includes("brita"));
+    else if (t.includes("pedrisco") || t.includes("pedris")) produtoMatch = data.produtos.find(p => /pedrisco/i.test(p.nome));
+    else if (t.includes("po de pedra") || t.includes("po pedra") || t.includes("pó")) produtoMatch = data.produtos.find(p => /po|pó/i.test(p.nome));
+    else if (t.includes("areia")) produtoMatch = data.produtos.find(p => p.nome.includes("Areia"));
+  }
+
+  // Numbers to use: if we found explicit toneladas in text, use that + last number as custo
+  // Otherwise fall back to first/second number
+  let toneladas, custo;
+  if (tonFromText) {
+    toneladas = tonFromText;
+    // Custo = largest number that is NOT the toneladas value
+    const outros = nums.filter(n => n !== tonFromText);
+    custo = outros.length > 0 ? outros[outros.length - 1] : 0;
+  } else {
+    toneladas = nums[0] || 0;
+    custo = nums[1] || 0;
+  }
+
+  // Find cliente
+  let clienteMatch = null;
+  for (const c of data.clientes) {
+    const cNorm = c.nome.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (t.includes(cNorm)) { clienteMatch = c; break; }
+    const lastName = cNorm.split(" ")[0];
+    if (t.includes(lastName) && lastName.length > 3) { clienteMatch = c; break; }
+  }
+
+  // Detect action
+  const isEntrada = /entrada|compra|comprei|comprou|chegou|recebi|recebeu/.test(t);
+  const isVenda = /venda|vendi|vendeu|vendido|saiu|saida/.test(t);
+  const isConsulta = /estoque|quanto|quantos|saldo|tem de|total/.test(t);
+  const isRelatorio = /relatorio|relatorios|vendas/.test(t);
+
+  if (isEntrada && produtoMatch && toneladas) {
+    const metros = toneladas / produtoMatch.fator;
+    return {
+      tipo: "entrada",
+      produtoId: produtoMatch.id,
+      produtoNome: produtoMatch.nome,
+      toneladas,
+      metros: parseFloat(metros.toFixed(2)),
+      custo,
+      msg: `Registrar entrada de ${toneladas}t de ${produtoMatch.nome} → ${metros.toFixed(2)}m³${custo ? ` — Custo: R$${custo}` : ""}?`
+    };
+  }
+
+  if (isVenda && produtoMatch && nums.length >= 1) {
+    const metros = nums[0];
+    // Get price from client or first number after metros
+    let preco = 0;
+    if (clienteMatch && clienteMatch.precos && clienteMatch.precos[produtoMatch.id]) {
+      preco = clienteMatch.precos[produtoMatch.id];
+    } else if (nums[1]) {
+      preco = nums[1];
+    }
+    const lucro = preco > 0 ? metros * preco : null;
+    return {
+      tipo: "venda",
+      produtoId: produtoMatch.id,
+      produtoNome: produtoMatch.nome,
+      clienteId: clienteMatch?.id || null,
+      clienteNome: clienteMatch?.nome || "Sem cliente",
+      metros,
+      preco,
+      lucro,
+      msg: `Registrar venda de ${metros}m³ de ${produtoMatch.nome}${clienteMatch ? ` para ${clienteMatch.nome}` : ""}${preco ? ` — R$${preco}/m³ = R$${(metros*preco).toFixed(2)}` : ""}?`
+    };
+  }
+
+  if (isConsulta) return { tipo: "consulta", msg: "Abrindo tela de Estoque..." };
+  if (isRelatorio) return { tipo: "relatorio", msg: "Abrindo Relatórios..." };
+
+  return { tipo: "erro", msg: `Não entendi: "${transcript}". Tente: "Entrada de 20 toneladas de areia fina a 80 reais" ou "Venda de 10 metros de brita pro João".` };
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+const fmt = (n) => n?.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) || "0,00";
+const fmtR = (n) => "R$ " + fmt(n);
+const today = () => new Date().toISOString().split("T")[0];
+const genId = () => Math.random().toString(36).slice(2, 10);
+
+function estoqueAtual(data) {
+  const e = {};
+  data.produtos.forEach(p => { e[p.id] = 0; });
+  data.entradas.forEach(en => { e[en.produtoId] = (e[en.produtoId] || 0) + en.metros; });
+  data.vendas.forEach(v => { e[v.produtoId] = (e[v.produtoId] || 0) - v.metros; });
+  return e;
+}
+
+// ─── STYLES ───────────────────────────────────────────────────────────────────
+const S = {
+  app: { minHeight: "100vh", background: "#0f172a", paddingBottom: 70 },
+  header: { background: "#1e293b", padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #334155", position: "sticky", top: 0, zIndex: 100 },
+  headerTitle: { fontSize: 18, fontWeight: 700, color: "#f59e0b", letterSpacing: 0.5 },
+  headerSub: { fontSize: 11, color: "#64748b", marginTop: 1 },
+  voiceBtn: { background: "linear-gradient(135deg, #7c3aed, #6d28d9)", border: "none", borderRadius: 24, padding: "8px 16px", color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, boxShadow: "0 2px 8px rgba(124,58,237,0.4)" },
+  voiceBtnActive: { background: "linear-gradient(135deg, #dc2626, #b91c1c)", animation: "pulse 1s infinite" },
+  nav: { position: "fixed", bottom: 0, left: 0, right: 0, background: "#1e293b", display: "flex", borderTop: "1px solid #334155", zIndex: 100 },
+  navBtn: { flex: 1, padding: "8px 4px 10px", border: "none", background: "transparent", color: "#64748b", cursor: "pointer", fontSize: 9, fontWeight: 500, display: "flex", flexDirection: "column", alignItems: "center", gap: 3 },
+  navBtnActive: { color: "#f59e0b" },
+  card: { background: "#1e293b", borderRadius: 12, padding: 14, margin: "0 0 12px" },
+  cardTitle: { fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 },
+  value: { fontSize: 24, fontWeight: 700, color: "#f1f5f9" },
+  valueSmall: { fontSize: 16, fontWeight: 700, color: "#f1f5f9" },
+  label: { fontSize: 12, color: "#64748b", marginTop: 2 },
+  section: { padding: "12px 16px" },
+  input: { background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: "10px 12px", color: "#f1f5f9", fontSize: 14, width: "100%", outline: "none" },
+  select: { background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: "10px 12px", color: "#f1f5f9", fontSize: 14, width: "100%", outline: "none" },
+  btnPrimary: { background: "#f59e0b", border: "none", borderRadius: 8, padding: "12px 16px", color: "#0f172a", fontSize: 14, fontWeight: 700, cursor: "pointer", width: "100%" },
+  btnSecondary: { background: "#1e293b", border: "1px solid #334155", borderRadius: 8, padding: "10px 16px", color: "#f1f5f9", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  btnDanger: { background: "#dc2626", border: "none", borderRadius: 8, padding: "8px 14px", color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer" },
+  inputLabel: { fontSize: 12, color: "#94a3b8", marginBottom: 4, display: "block" },
+  row: { display: "flex", gap: 10, marginBottom: 12 },
+  badge: { display: "inline-block", padding: "2px 8px", borderRadius: 20, fontSize: 11, fontWeight: 600 },
+  divider: { height: 1, background: "#334155", margin: "12px 0" },
+  tag: { background: "#0f172a", borderRadius: 6, padding: "8px 10px", fontSize: 13 },
+  modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 200, display: "flex", alignItems: "flex-end" },
+  modal: { background: "#1e293b", borderRadius: "20px 20px 0 0", padding: 20, width: "100%", maxHeight: "90vh", overflowY: "auto" },
+  modalTitle: { fontSize: 16, fontWeight: 700, color: "#f1f5f9", marginBottom: 14 },
+};
+
+// ─── VOICE MODAL ──────────────────────────────────────────────────────────────
+function VoiceModal({ onClose, data, onConfirm }) {
+  const [status, setStatus] = useState("idle"); // idle | listening | done | error
+  const [transcript, setTranscript] = useState("");
+  const [result, setResult] = useState(null);
+  const recognRef = useRef(null);
+  const dataRef = useRef(data);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
+  const startListening = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setStatus("error");
+      setResult({ tipo: "erro", msg: "Reconhecimento de voz não suportado neste navegador. Use Chrome no Android." });
+      return;
+    }
+    const recog = new SR();
+    recognRef.current = recog;
+    recog.lang = "pt-BR";
+    recog.interimResults = false;
+    recog.maxAlternatives = 3;
+    recog.continuous = true; // mantém ouvindo sem parar no primeiro silêncio
+
+    let finalTimer = null;
+
+    recog.onstart = () => setStatus("listening");
+    recog.onresult = (e) => {
+      // Cancela timer anterior — usuário ainda está falando
+      clearTimeout(finalTimer);
+      // Pega o último resultado final
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          const text = e.results[i][0].transcript;
+          // Aguarda 1.5s de silêncio antes de processar
+          finalTimer = setTimeout(() => {
+            recog.stop();
+            setTranscript(text);
+            const parsed = parseVoice(text, dataRef.current);
+            setResult(parsed);
+            setStatus("done");
+          }, 1500);
+        }
+      }
+    };
+    recog.onerror = (e) => {
+      clearTimeout(finalTimer);
+      if (e.error === "no-speech") return; // ignora silêncio — modo continuous gera isso
+      setStatus("error");
+      const msgs = {
+        "not-allowed": "Permissão de microfone negada. Libere nas configurações do Chrome.",
+        "network": "Sem conexão. O reconhecimento de voz precisa de internet.",
+      };
+      setResult({ tipo: "erro", msg: msgs[e.error] || `Erro: ${e.error}` });
+    };
+    recog.onend = () => { /* não faz nada — controlado pelo timer acima */ };
+
+    try { recog.start(); } catch (e) { setStatus("error"); setResult({ tipo: "erro", msg: "Erro ao iniciar microfone." }); }
+  }, []);
+
+  const stopListening = () => {
+    recognRef.current?.stop();
+    setStatus("idle");
+    setResult(null);
+  };
+
+  const handleConfirm = () => {
+    if (result && result.tipo !== "erro" && result.tipo !== "consulta" && result.tipo !== "relatorio") {
+      onConfirm(result);
+    } else if (result?.tipo === "consulta" || result?.tipo === "relatorio") {
+      onConfirm(result);
+    }
+    onClose();
+  };
+
+  return (
+    <div style={S.modalOverlay} onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div style={S.modal}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={S.modalTitle}>🎤 Comando de Voz</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
+        </div>
+
+        {status === "idle" && !result && (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 16, lineHeight: 1.8 }}>
+              Exemplos:<br/>
+              <em>"Entrada de 28 toneladas de areia fina a 80 reais"</em><br/>
+              <em>"Venda de 10 metros de brita pro João"</em>
+            </div>
+            <button onClick={startListening} style={{ ...S.voiceBtn, margin: "0 auto", fontSize: 15, padding: "12px 24px" }}>
+              🎤 Falar
+            </button>
+          </div>
+        )}
+
+        {status === "listening" && (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <div style={{ fontSize: 36, marginBottom: 8 }}>🔴</div>
+            <div style={{ color: "#f59e0b", fontWeight: 600, marginBottom: 12 }}>Ouvindo...</div>
+            <button onClick={stopListening} style={{ ...S.btnSecondary }}>Parar</button>
+          </div>
+        )}
+
+        {(status === "done" || status === "error") && result && (
+          <div>
+            {transcript && (
+              <div style={{ background: "#0f172a", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 13, color: "#94a3b8" }}>
+                <span style={{ color: "#64748b", fontSize: 11 }}>Você disse:</span><br/>
+                <em>"{transcript}"</em>
+              </div>
+            )}
+            <div style={{ background: result.tipo === "erro" ? "#450a0a" : "#052e16", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+              <div style={{ color: result.tipo === "erro" ? "#fca5a5" : "#86efac", fontSize: 14, lineHeight: 1.5 }}>
+                {result.tipo === "erro" ? "❌ " : "✅ "}{result.msg}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              {result.tipo !== "erro" && (
+                <button onClick={handleConfirm} style={S.btnPrimary}>Confirmar</button>
+              )}
+              <button onClick={() => { setStatus("idle"); setResult(null); setTranscript(""); }} style={{ ...S.btnSecondary, flex: 1 }}>
+                {result.tipo === "erro" ? "Tentar de novo" : "Falar de novo"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── INÍCIO ───────────────────────────────────────────────────────────────────
+function TelaInicio({ data }) {
+  const estoque = estoqueAtual(data);
+  const todayStr = today();
+  const vendasHoje = data.vendas.filter(v => v.data === todayStr);
+  const receitaHoje = vendasHoje.reduce((s, v) => s + (v.metros * v.preco), 0);
+  const custoHoje = data.entradas.filter(e => e.data === todayStr).reduce((s, e) => s + e.custo, 0);
+  const lucroHoje = receitaHoje - custoHoje;
+
+  return (
+    <div style={S.section}>
+      <div style={{ fontSize: 13, color: "#64748b", marginBottom: 12 }}>
+        {new Date().toLocaleDateString("pt-BR", { weekday: "long", day: "numeric", month: "long" })}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Receita Hoje</div>
+          <div style={{ ...S.valueSmall, color: "#34d399" }}>{fmtR(receitaHoje)}</div>
+        </div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Lucro Hoje</div>
+          <div style={{ ...S.valueSmall, color: lucroHoje >= 0 ? "#34d399" : "#f87171" }}>{fmtR(lucroHoje)}</div>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>Estoque Atual (m³)</div>
+        {data.produtos.map(p => (
+          <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #334155" }}>
+            <span style={{ fontSize: 14 }}>{p.nome}</span>
+            <span style={{ fontSize: 15, fontWeight: 700, color: (estoque[p.id] || 0) < 5 ? "#f87171" : "#34d399" }}>
+              {fmt(estoque[p.id] || 0)} m³
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>Últimas Vendas</div>
+        {data.vendas.slice(-5).reverse().map(v => {
+          const prod = data.produtos.find(p => p.id === v.produtoId);
+          const cli = data.clientes.find(c => c.id === v.clienteId);
+          return (
+            <div key={v.id} style={{ padding: "8px 0", borderBottom: "1px solid #334155", fontSize: 13 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>{prod?.nome} — {fmt(v.metros)}m³</span>
+                <span style={{ color: "#34d399", fontWeight: 600 }}>{fmtR(v.metros * v.preco)}</span>
+              </div>
+              <div style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+                {cli?.nome || "Sem cliente"} · {v.data}
+              </div>
+            </div>
+          );
+        })}
+        {data.vendas.length === 0 && <div style={{ color: "#475569", fontSize: 13 }}>Nenhuma venda registrada</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── ESTOQUE ──────────────────────────────────────────────────────────────────
+function TelaEstoque({ data }) {
+  const estoque = estoqueAtual(data);
+  const [prodSel, setProdSel] = useState(null);
+
+  const historico = prodSel
+    ? [
+        ...data.entradas.filter(e => e.produtoId === prodSel).map(e => ({ ...e, tipo: "entrada", qtd: e.metros, valor: e.custo })),
+        ...data.vendas.filter(v => v.produtoId === prodSel).map(v => ({ ...v, tipo: "venda", qtd: v.metros, valor: v.metros * v.preco })),
+      ].sort((a, b) => new Date(b.data) - new Date(a.data))
+    : [];
+
+  return (
+    <div style={S.section}>
+      {data.produtos.map(p => (
+        <div key={p.id} style={{ ...S.card, cursor: "pointer", border: prodSel === p.id ? "1px solid #f59e0b" : "1px solid transparent" }}
+          onClick={() => setProdSel(prodSel === p.id ? null : p.id)}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 15 }}>{p.nome}</div>
+              <div style={{ fontSize: 11, color: "#64748b" }}>Fator: {p.fator} t/m³</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: (estoque[p.id] || 0) < 5 ? "#f87171" : "#34d399" }}>
+                {fmt(estoque[p.id] || 0)}
+              </div>
+              <div style={{ fontSize: 11, color: "#64748b" }}>m³</div>
+            </div>
+          </div>
+
+          {prodSel === p.id && historico.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <div style={S.divider} />
+              <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, marginBottom: 8 }}>HISTÓRICO</div>
+              {historico.slice(0, 10).map(h => (
+                <div key={h.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e293b", fontSize: 12 }}>
+                  <div>
+                    <span style={{ ...S.badge, background: h.tipo === "entrada" ? "#1d4ed8" : "#065f46", color: h.tipo === "entrada" ? "#93c5fd" : "#6ee7b7" }}>
+                      {h.tipo === "entrada" ? "▲ Entrada" : "▼ Venda"}
+                    </span>
+                    <span style={{ color: "#94a3b8", marginLeft: 6 }}>{h.data}</span>
+                  </div>
+                  <span style={{ fontWeight: 600 }}>{fmt(h.qtd)} m³</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── ENTRADA ──────────────────────────────────────────────────────────────────
+function TelaEntrada({ data, setData }) {
+  const [form, setForm] = useState({ produtoId: data.produtos[0]?.id || "", toneladas: "", custo: "" });
+  const [ok, setOk] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+
+  const produto = data.produtos.find(p => p.id === form.produtoId);
+  const metros = form.toneladas ? parseFloat((parseFloat(form.toneladas) / (produto?.fator || 1)).toFixed(2)) : null;
+  const custoM3 = metros && form.custo ? (parseFloat(form.custo) / metros).toFixed(2) : null;
+
+  const submit = () => {
+    if (!form.produtoId || !form.toneladas) return;
+    const tons = parseFloat(form.toneladas);
+    const custo = parseFloat(form.custo) || 0;
+    const m3 = parseFloat((tons / (produto?.fator || 1)).toFixed(2));
+
+    if (editItem) {
+      const prod = data.produtos.find(p => p.id === form.produtoId);
+      const m3e = parseFloat((tons / (prod?.fator || 1)).toFixed(2));
+      const updated = { ...editItem, produtoId: form.produtoId, toneladas: tons, metros: m3e, custo };
+      const nd = { ...data, entradas: data.entradas.map(e => e.id === editItem.id ? updated : e) };
+      setData(nd); saveData(nd); setEditItem(null);
+    } else {
+      const nova = { id: genId(), produtoId: form.produtoId, toneladas: tons, metros: m3, custo, data: today() };
+      const nd = { ...data, entradas: [...data.entradas, nova] };
+      setData(nd); saveData(nd);
+      setOk(true); setTimeout(() => setOk(false), 2000);
+    }
+    setForm({ produtoId: form.produtoId, toneladas: "", custo: "" });
+  };
+
+  const startEdit = (e) => {
+    setEditItem(e);
+    setForm({ produtoId: e.produtoId, toneladas: e.toneladas.toString(), custo: e.custo.toString() });
+    window.scrollTo(0, 0);
+  };
+
+  const cancelEdit = () => {
+    setEditItem(null);
+    setForm({ produtoId: data.produtos[0]?.id || "", toneladas: "", custo: "" });
+  };
+
+  const del = (id) => {
+    if (!confirm("Excluir esta entrada?")) return;
+    const nd = { ...data, entradas: data.entradas.filter(e => e.id !== id) };
+    setData(nd); saveData(nd);
+  };
+
+  return (
+    <div style={S.section}>
+      <div style={{ ...S.card, border: editItem ? "1px solid #93c5fd" : "1px solid transparent" }}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, color: "#93c5fd" }}>
+          {editItem ? "✏️ Editar Entrada" : "📥 Nova Entrada"}
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={S.inputLabel}>Produto</label>
+          <select style={S.select} value={form.produtoId} onChange={e => setForm({ ...form, produtoId: e.target.value })}>
+            {data.produtos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
+          </select>
+        </div>
+        <div style={S.row}>
+          <div style={{ flex: 1 }}>
+            <label style={S.inputLabel}>Toneladas</label>
+            <input style={S.input} type="number" inputMode="decimal" placeholder="0" value={form.toneladas} onChange={e => setForm({ ...form, toneladas: e.target.value })} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.inputLabel}>Custo total (R$)</label>
+            <input style={S.input} type="number" inputMode="decimal" placeholder="0" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} />
+          </div>
+        </div>
+        {metros && (
+          <div style={{ background: "#0f172a", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 13 }}>
+            <span style={{ color: "#93c5fd" }}>{metros} m³</span>
+            <span style={{ color: "#64748b" }}> ({produto?.fator} t/m³)</span>
+            {custoM3 && <span style={{ color: "#fbbf24", marginLeft: 12, fontWeight: 600 }}>· R$ {custoM3}/m³</span>}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 10 }}>
+          <button style={{ ...S.btnPrimary, background: ok ? "#059669" : "#f59e0b" }} onClick={submit}>
+            {editItem ? "💾 Salvar" : ok ? "✓ Registrado!" : "Registrar Entrada"}
+          </button>
+          {editItem && <button style={S.btnSecondary} onClick={cancelEdit}>Cancelar</button>}
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginBottom: 10 }}>ÚLTIMAS ENTRADAS</div>
+        {data.entradas.slice(-20).reverse().map(e => {
+          const p = data.produtos.find(p2 => p2.id === e.produtoId);
+          const cm3 = e.metros > 0 ? (e.custo / e.metros).toFixed(2) : null;
+          return (
+            <div key={e.id} style={{ padding: "8px 0", borderBottom: "1px solid #334155", fontSize: 13 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{p?.nome} — {e.toneladas}t</span>
+                    <span style={{ color: "#93c5fd" }}>{fmt(e.metros)} m³</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>
+                    {e.data} · Total: {fmtR(e.custo)}
+                    {cm3 && <span style={{ color: "#fbbf24", marginLeft: 6 }}>· {fmtR(parseFloat(cm3))}/m³</span>}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, marginLeft: 10 }}>
+                  <button onClick={() => startEdit(e)} style={{ background: "#1d4ed8", border: "none", borderRadius: 6, padding: "4px 8px", color: "#93c5fd", fontSize: 11, cursor: "pointer" }}>✏️</button>
+                  <button onClick={() => del(e.id)} style={{ background: "#450a0a", border: "none", borderRadius: 6, padding: "4px 8px", color: "#f87171", fontSize: 11, cursor: "pointer" }}>✕</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {data.entradas.length === 0 && <div style={{ color: "#475569", fontSize: 13 }}>Nenhuma entrada</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── VENDA ────────────────────────────────────────────────────────────────────
+function TelaVenda({ data, setData }) {
+  const [form, setForm] = useState({ produtoId: data.produtos[0]?.id || "", clienteId: "", metros: "", preco: "" });
+  const [ok, setOk] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+
+  const estoque = estoqueAtual(data);
+  const cliente = data.clientes.find(c => c.id === form.clienteId);
+
+  useEffect(() => {
+    if (!editItem && cliente && form.produtoId && cliente.precos?.[form.produtoId]) {
+      setForm(f => ({ ...f, preco: cliente.precos[form.produtoId].toString() }));
+    }
+  }, [form.clienteId, form.produtoId, editItem]);
+
+  const receita = form.metros && form.preco ? (parseFloat(form.metros) * parseFloat(form.preco)).toFixed(2) : "";
+
+  const submit = () => {
+    if (!form.produtoId || !form.metros || !form.preco) return;
+    const metros = parseFloat(form.metros);
+
+    if (editItem) {
+      const updated = {
+        ...editItem,
+        produtoId: form.produtoId,
+        clienteId: form.clienteId || null,
+        metros, preco: parseFloat(form.preco),
+      };
+      const nd = { ...data, vendas: data.vendas.map(v => v.id === editItem.id ? updated : v) };
+      setData(nd); saveData(nd); setEditItem(null);
+    } else {
+      // Estoque check: desconta o que já foi vendido, mas não conta a venda atual
+      if (metros > (estoque[form.produtoId] || 0)) {
+        alert("Estoque insuficiente!");
+        return;
+      }
+      const nova = {
+        id: genId(), produtoId: form.produtoId,
+        clienteId: form.clienteId || null,
+        metros, preco: parseFloat(form.preco),
+        data: today(),
+      };
+      const nd = { ...data, vendas: [...data.vendas, nova] };
+      setData(nd); saveData(nd);
+      setOk(true); setTimeout(() => setOk(false), 2000);
+    }
+    setForm({ produtoId: data.produtos[0]?.id || "", clienteId: "", metros: "", preco: "" });
+  };
+
+  const startEdit = (v) => {
+    setEditItem(v);
+    setForm({ produtoId: v.produtoId, clienteId: v.clienteId || "", metros: v.metros.toString(), preco: v.preco.toString() });
+    window.scrollTo(0, 0);
+  };
+
+  const cancelEdit = () => {
+    setEditItem(null);
+    setForm({ produtoId: data.produtos[0]?.id || "", clienteId: "", metros: "", preco: "" });
+  };
+
+  const del = (id) => {
+    if (!confirm("Excluir esta venda?")) return;
+    const nd = { ...data, vendas: data.vendas.filter(v => v.id !== id) };
+    setData(nd); saveData(nd);
+  };
+
+  return (
+    <div style={S.section}>
+      <div style={{ ...S.card, border: editItem ? "1px solid #34d399" : "1px solid transparent" }}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, color: "#34d399" }}>
+          {editItem ? "✏️ Editar Venda" : "💰 Nova Venda"}
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={S.inputLabel}>Produto</label>
+          <select style={S.select} value={form.produtoId} onChange={e => setForm({ ...form, produtoId: e.target.value })}>
+            {data.produtos.map(p => (
+              <option key={p.id} value={p.id}>{p.nome} — {fmt(estoque[p.id] || 0)} m³</option>
+            ))}
+          </select>
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={S.inputLabel}>Cliente (opcional)</label>
+          <select style={S.select} value={form.clienteId} onChange={e => setForm({ ...form, clienteId: e.target.value })}>
+            <option value="">— Sem cliente —</option>
+            {data.clientes.map(c => <option key={c.id} value={c.id}>{c.nome}</option>)}
+          </select>
+        </div>
+        <div style={S.row}>
+          <div style={{ flex: 1 }}>
+            <label style={S.inputLabel}>Metros cúbicos (m³)</label>
+            <input style={S.input} type="number" inputMode="decimal" placeholder="0" value={form.metros} onChange={e => setForm({ ...form, metros: e.target.value })} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.inputLabel}>Preço/m³ (R$)</label>
+            <input style={S.input} type="number" inputMode="decimal" placeholder="0" value={form.preco} onChange={e => setForm({ ...form, preco: e.target.value })} />
+          </div>
+        </div>
+        {receita && (
+          <div style={{ background: "#0f172a", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 13, color: "#34d399" }}>
+            Total: R$ {receita}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 10 }}>
+          <button style={{ ...S.btnPrimary, background: ok ? "#059669" : "#f59e0b" }} onClick={submit}>
+            {editItem ? "💾 Salvar" : ok ? "✓ Registrado!" : "Registrar Venda"}
+          </button>
+          {editItem && <button style={S.btnSecondary} onClick={cancelEdit}>Cancelar</button>}
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginBottom: 10 }}>ÚLTIMAS VENDAS</div>
+        {data.vendas.slice(-20).reverse().map(v => {
+          const p = data.produtos.find(p2 => p2.id === v.produtoId);
+          const c = data.clientes.find(c2 => c2.id === v.clienteId);
+          return (
+            <div key={v.id} style={{ padding: "8px 0", borderBottom: "1px solid #334155", fontSize: 13 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{p?.nome} — {fmt(v.metros)}m³</span>
+                    <span style={{ color: "#34d399", fontWeight: 600 }}>{fmtR(v.metros * v.preco)}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{c?.nome || "Sem cliente"} · {v.data}</div>
+                </div>
+                <div style={{ display: "flex", gap: 6, marginLeft: 10 }}>
+                  <button onClick={() => startEdit(v)} style={{ background: "#065f46", border: "none", borderRadius: 6, padding: "4px 8px", color: "#6ee7b7", fontSize: 11, cursor: "pointer" }}>✏️</button>
+                  <button onClick={() => del(v.id)} style={{ background: "#450a0a", border: "none", borderRadius: 6, padding: "4px 8px", color: "#f87171", fontSize: 11, cursor: "pointer" }}>✕</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {data.vendas.length === 0 && <div style={{ color: "#475569", fontSize: 13 }}>Nenhuma venda</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── CLIENTES ─────────────────────────────────────────────────────────────────
+function TelaClientes({ data, setData }) {
+  const [nome, setNome] = useState("");
+  const [editId, setEditId] = useState(null);
+  const [precos, setPrecos] = useState({});
+  const [expandId, setExpandId] = useState(null);
+
+  const startEdit = (cli) => {
+    setEditId(cli.id); setNome(cli.nome);
+    const p = {};
+    data.produtos.forEach(pr => { p[pr.id] = cli.precos?.[pr.id]?.toString() || ""; });
+    setPrecos(p);
+  };
+
+  const cancelEdit = () => { setEditId(null); setNome(""); setPrecos({}); };
+
+  const save = () => {
+    if (!nome.trim()) return;
+    const p = {};
+    Object.entries(precos).forEach(([k, v]) => { if (v) p[k] = parseFloat(v); });
+
+    let nd;
+    if (editId) {
+      nd = { ...data, clientes: data.clientes.map(c => c.id === editId ? { ...c, nome: nome.trim(), precos: p } : c) };
+    } else {
+      nd = { ...data, clientes: [...data.clientes, { id: genId(), nome: nome.trim(), precos: p }] };
+    }
+    setData(nd); saveData(nd); cancelEdit();
+  };
+
+  const del = (id) => {
+    if (!confirm("Excluir cliente?")) return;
+    const nd = { ...data, clientes: data.clientes.filter(c => c.id !== id) };
+    setData(nd); saveData(nd);
+  };
+
+  return (
+    <div style={S.section}>
+      <div style={S.card}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, color: "#a78bfa" }}>
+          {editId ? "✏️ Editar Cliente" : "➕ Novo Cliente"}
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={S.inputLabel}>Nome do cliente</label>
+          <input style={S.input} placeholder="Nome" value={nome} onChange={e => setNome(e.target.value)} />
+        </div>
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 8 }}>Preços por produto (R$/m³)</div>
+          {data.produtos.map(p => (
+            <div key={p.id} style={S.row}>
+              <div style={{ flex: 1 }}>
+                <label style={S.inputLabel}>{p.nome}</label>
+                <input style={S.input} type="number" inputMode="decimal" placeholder="0,00"
+                  value={precos[p.id] || ""}
+                  onChange={e => setPrecos({ ...precos, [p.id]: e.target.value })} />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button style={S.btnPrimary} onClick={save}>{editId ? "Salvar" : "Adicionar"}</button>
+          {editId && <button style={S.btnSecondary} onClick={cancelEdit}>Cancelar</button>}
+        </div>
+      </div>
+
+      {data.clientes.map(c => (
+        <div key={c.id} style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ cursor: "pointer", flex: 1 }} onClick={() => setExpandId(expandId === c.id ? null : c.id)}>
+              <div style={{ fontWeight: 600 }}>{c.nome}</div>
+              <div style={{ fontSize: 11, color: "#64748b" }}>
+                {Object.keys(c.precos || {}).length} preços configurados
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => startEdit(c)} style={{ ...S.btnSecondary, padding: "6px 12px", fontSize: 12 }}>Editar</button>
+              <button onClick={() => del(c.id)} style={{ ...S.btnDanger, padding: "6px 12px", fontSize: 12 }}>✕</button>
+            </div>
+          </div>
+          {expandId === c.id && (
+            <div style={{ marginTop: 10 }}>
+              <div style={S.divider} />
+              {data.produtos.map(p => (
+                <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0" }}>
+                  <span style={{ color: "#94a3b8" }}>{p.nome}</span>
+                  <span>{c.precos?.[p.id] ? fmtR(c.precos[p.id]) + "/m³" : <span style={{ color: "#475569" }}>—</span>}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+      {data.clientes.length === 0 && (
+        <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 20 }}>Nenhum cliente cadastrado</div>
+      )}
+    </div>
+  );
+}
+
+// ─── RELATÓRIOS ───────────────────────────────────────────────────────────────
+function TelaRelatorios({ data }) {
+  const [periodo, setPeriodo] = useState("diario");
+
+  const now = new Date();
+  const filtrarVendas = (v) => {
+    const d = new Date(v.data);
+    if (periodo === "diario") return v.data === today();
+    if (periodo === "semanal") {
+      const start = new Date(now); start.setDate(now.getDate() - 7);
+      return d >= start;
+    }
+    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+  };
+  const filtrarEntradas = (e) => {
+    const d = new Date(e.data);
+    if (periodo === "diario") return e.data === today();
+    if (periodo === "semanal") {
+      const start = new Date(now); start.setDate(now.getDate() - 7);
+      return d >= start;
+    }
+    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+  };
+
+  const vendas = data.vendas.filter(filtrarVendas);
+
+  // Custo médio por m³ de cada produto (todas as entradas, não só do período)
+  const custoMedio = {};
+  data.produtos.forEach(p => {
+    const ents = data.entradas.filter(e => e.produtoId === p.id);
+    const totalMetros = ents.reduce((s, e) => s + e.metros, 0);
+    const totalCusto = ents.reduce((s, e) => s + e.custo, 0);
+    custoMedio[p.id] = totalMetros > 0 ? totalCusto / totalMetros : 0;
+  });
+
+  const receita = vendas.reduce((s, v) => s + (v.metros * v.preco), 0);
+  // Custo proporcional ao que foi vendido no período
+  const custo = vendas.reduce((s, v) => s + (v.metros * (custoMedio[v.produtoId] || 0)), 0);
+  const lucro = receita - custo;
+
+  // Por produto
+  const porProduto = {};
+  data.produtos.forEach(p => { porProduto[p.id] = { nome: p.nome, vendido: 0, receita: 0, custo: 0 }; });
+  vendas.forEach(v => {
+    if (porProduto[v.produtoId]) {
+      porProduto[v.produtoId].vendido += v.metros;
+      porProduto[v.produtoId].receita += v.metros * v.preco;
+      porProduto[v.produtoId].custo += v.metros * (custoMedio[v.produtoId] || 0);
+    }
+  });
+
+  // Por cliente
+  const porCliente = {};
+  vendas.forEach(v => {
+    const k = v.clienteId || "sem_cliente";
+    if (!porCliente[k]) {
+      const c = data.clientes.find(c2 => c2.id === v.clienteId);
+      porCliente[k] = { nome: c?.nome || "Sem cliente", total: 0 };
+    }
+    porCliente[k].total += v.metros * v.preco;
+  });
+
+  return (
+    <div style={S.section}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        {["diario", "semanal", "mensal"].map(p => (
+          <button key={p} onClick={() => setPeriodo(p)}
+            style={{ flex: 1, padding: "8px 0", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600,
+              background: periodo === p ? "#f59e0b" : "#1e293b", color: periodo === p ? "#0f172a" : "#64748b" }}>
+            {p === "diario" ? "Diário" : p === "semanal" ? "Semanal" : "Mensal"}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Receita</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#34d399" }}>{fmtR(receita)}</div>
+        </div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Custo</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#f87171" }}>{fmtR(custo)}</div>
+        </div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Lucro</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: lucro >= 0 ? "#34d399" : "#f87171" }}>{fmtR(lucro)}</div>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginBottom: 10 }}>POR PRODUTO</div>
+        {Object.values(porProduto).filter(p => p.vendido > 0).map(p => {
+          const lucProd = p.receita - p.custo;
+          return (
+            <div key={p.nome} style={{ padding: "8px 0", borderBottom: "1px solid #334155", fontSize: 13 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>{p.nome}</span>
+                <span style={{ fontWeight: 600 }}>{fmtR(p.receita)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+                <span style={{ fontSize: 11, color: "#64748b" }}>{fmt(p.vendido)} m³ · custo {fmtR(p.custo)}</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: lucProd >= 0 ? "#34d399" : "#f87171" }}>lucro {fmtR(lucProd)}</span>
+              </div>
+            </div>
+          );
+        })}
+        {vendas.length === 0 && <div style={{ color: "#475569", fontSize: 13 }}>Sem vendas neste período</div>}
+      </div>
+
+      {Object.keys(porCliente).length > 0 && (
+        <div style={S.card}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginBottom: 10 }}>POR CLIENTE</div>
+          {Object.values(porCliente).sort((a, b) => b.total - a.total).map(c => (
+            <div key={c.nome} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #334155", fontSize: 13 }}>
+              <span>{c.nome}</span>
+              <span style={{ fontWeight: 600, color: "#34d399" }}>{fmtR(c.total)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+function TelaConfig({ data, setData }) {
+  const [prods, setProds] = useState(() =>
+    data.produtos.map(p => ({ ...p, fatorStr: p.fator.toString(), precoCustoStr: (p.precoCusto || "").toString() }))
+  );
+  const [ok, setOk] = useState(false);
+  const [nomeProd, setNomeProd] = useState("");
+
+  // Keep prods in sync if data changes externally
+  useEffect(() => {
+    setProds(data.produtos.map(p => ({ ...p, fatorStr: p.fator.toString(), precoCustoStr: (p.precoCusto || "").toString() })));
+  }, [data.produtos.length]);
+
+  const mover = (idx, dir) => {
+    const arr = [...prods];
+    const swap = idx + dir;
+    if (swap < 0 || swap >= arr.length) return;
+    [arr[idx], arr[swap]] = [arr[swap], arr[idx]];
+    setProds(arr);
+  };
+
+  const salvar = () => {
+    const nd = { ...data, produtos: prods.map(p => ({
+      id: p.id, nome: p.nome,
+      fator: parseFloat(p.fatorStr) || p.fator,
+      precoCusto: parseFloat(p.precoCustoStr) || 0,
+    })) };
+    setData(nd); saveData(nd); setOk(true); setTimeout(() => setOk(false), 2000);
+  };
+
+  const addProduto = () => {
+    if (!nomeProd.trim()) return;
+    const novo = { id: genId(), nome: nomeProd.trim(), fator: 1.4, fatorStr: "1.4" };
+    const arr = [...prods, novo];
+    setProds(arr);
+    const nd = { ...data, produtos: arr.map(p => ({ id: p.id, nome: p.nome, fator: parseFloat(p.fatorStr) || p.fator })) };
+    setData(nd); saveData(nd); setNomeProd("");
+  };
+
+  const delProduto = (id) => {
+    if (!confirm("Excluir produto? Os registros vinculados não serão apagados.")) return;
+    const arr = prods.filter(p => p.id !== id);
+    setProds(arr);
+    const nd = { ...data, produtos: arr.map(p => ({ id: p.id, nome: p.nome, fator: parseFloat(p.fatorStr) || p.fator })) };
+    setData(nd); saveData(nd);
+  };
+
+  const exportar = () => {
+    const csv = ["Data,Tipo,Produto,Quantidade,Unidade,Preco,Cliente"];
+    data.entradas.forEach(e => {
+      const p = data.produtos.find(p2 => p2.id === e.produtoId);
+      csv.push(`${e.data},Entrada,${p?.nome},${e.toneladas},t,${e.custo},`);
+    });
+    data.vendas.forEach(v => {
+      const p = data.produtos.find(p2 => p2.id === v.produtoId);
+      const c = data.clientes.find(c2 => c2.id === v.clienteId);
+      csv.push(`${v.data},Venda,${p?.nome},${v.metros},m3,${v.preco},${c?.nome || ""}`);
+    });
+    const blob = new Blob([csv.join("\n")], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `areiacontrol-${today()}.csv`;
+    a.click();
+  };
+
+  const backup = () => {
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `areiacontrol-backup-${today()}.json`;
+    a.click();
+  };
+
+  const restaurar = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const d = JSON.parse(ev.target.result);
+        setData(d); saveData(d); alert("Backup restaurado!");
+      } catch { alert("Arquivo inválido!"); }
+    };
+    reader.readAsText(file);
+  };
+
+  return (
+    <div style={S.section}>
+      <div style={S.card}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 14, color: "#f59e0b" }}>⚙️ Produtos — Ordem, Nome e Fator</div>
+        {prods.map((p, idx) => (
+          <div key={p.id} style={{ background: "#0f172a", borderRadius: 8, padding: 10, marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <button onClick={() => mover(idx, -1)} disabled={idx === 0}
+                  style={{ background: idx === 0 ? "#1e293b" : "#334155", border: "none", borderRadius: 4, color: idx === 0 ? "#475569" : "#f1f5f9", width: 24, height: 20, cursor: idx === 0 ? "default" : "pointer", fontSize: 10 }}>▲</button>
+                <button onClick={() => mover(idx, 1)} disabled={idx === prods.length - 1}
+                  style={{ background: idx === prods.length - 1 ? "#1e293b" : "#334155", border: "none", borderRadius: 4, color: idx === prods.length - 1 ? "#475569" : "#f1f5f9", width: 24, height: 20, cursor: idx === prods.length - 1 ? "default" : "pointer", fontSize: 10 }}>▼</button>
+              </div>
+              <input style={{ ...S.input, flex: 1, fontSize: 13 }} value={p.nome}
+                onChange={e => setProds(prods.map((x, i) => i === idx ? { ...x, nome: e.target.value } : x))} />
+              <button onClick={() => delProduto(p.id)} style={{ background: "#450a0a", border: "none", borderRadius: 6, padding: "4px 8px", color: "#f87171", fontSize: 12, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+              <span style={{ fontSize: 11, color: "#64748b", whiteSpace: "nowrap" }}>Fator t/m³:</span>
+              <input style={{ ...S.input, width: 80, fontSize: 13 }} type="number" inputMode="decimal" step="0.1"
+                value={p.fatorStr}
+                onChange={e => setProds(prods.map((x, i) => i === idx ? { ...x, fatorStr: e.target.value } : x))} />
+              <span style={{ fontSize: 11, color: "#64748b", whiteSpace: "nowrap", marginLeft: 8 }}>Preço compra R$/t:</span>
+              <input style={{ ...S.input, width: 90, fontSize: 13 }} type="number" inputMode="decimal" placeholder="0"
+                value={p.precoCustoStr}
+                onChange={e => setProds(prods.map((x, i) => i === idx ? { ...x, precoCustoStr: e.target.value } : x))} />
+            </div>
+          </div>
+        ))}
+        <button style={{ ...S.btnPrimary, background: ok ? "#059669" : "#f59e0b", marginTop: 4 }} onClick={salvar}>
+          {ok ? "✓ Salvo!" : "Salvar Produtos"}
+        </button>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 14, color: "#a78bfa" }}>➕ Adicionar Produto</div>
+        <div style={S.row}>
+          <input style={{ ...S.input, flex: 1 }} placeholder="Nome do produto" value={nomeProd} onChange={e => setNomeProd(e.target.value)} />
+          <button style={{ ...S.btnPrimary, width: "auto", padding: "0 16px" }} onClick={addProduto}>Add</button>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 14, color: "#34d399" }}>📤 Exportar & Backup</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <button style={{ ...S.btnPrimary, background: "#0f172a", color: "#34d399", border: "1px solid #34d399" }} onClick={exportar}>
+            📊 Exportar CSV
+          </button>
+          <button style={{ ...S.btnPrimary, background: "#0f172a", color: "#93c5fd", border: "1px solid #3b82f6" }} onClick={backup}>
+            💾 Fazer Backup (JSON)
+          </button>
+          <label style={{ ...S.btnPrimary, background: "#0f172a", color: "#f59e0b", border: "1px solid #f59e0b", textAlign: "center", display: "block", cursor: "pointer" }}>
+            🔄 Restaurar Backup
+            <input type="file" accept=".json" style={{ display: "none" }} onChange={restaurar} />
+          </label>
+        </div>
+      </div>
+
+      <div style={{ ...S.card, borderColor: "#dc2626", border: "1px solid #450a0a" }}>
+        <div style={{ fontSize: 13, color: "#f87171", fontWeight: 600, marginBottom: 10 }}>⚠️ ZONA DE PERIGO</div>
+        <button style={{ ...S.btnDanger, width: "100%" }}
+          onClick={() => { if (confirm("Apagar TODOS os dados? Faça backup primeiro!")) { setData(DEFAULT_DATA); saveData(DEFAULT_DATA); } }}>
+          🗑️ Apagar todos os dados
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── APP ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [data, setData] = useState(loadData);
+  const [tela, setTela] = useState("inicio");
+  const [voiceOpen, setVoiceOpen] = useState(false);
+
+  const handleVoiceConfirm = useCallback((result) => {
+    if (result.tipo === "entrada") {
+      const nova = {
+        id: genId(), produtoId: result.produtoId,
+        toneladas: result.toneladas, metros: result.metros,
+        custo: result.custo || 0, data: today(),
+      };
+      setData(d => { const nd = { ...d, entradas: [...d.entradas, nova] }; saveData(nd); return nd; });
+      setTela("inicio");
+    } else if (result.tipo === "venda") {
+      const nova = {
+        id: genId(), produtoId: result.produtoId,
+        clienteId: result.clienteId || null,
+        metros: result.metros, preco: result.preco, data: today(),
+      };
+      setData(d => { const nd = { ...d, vendas: [...d.vendas, nova] }; saveData(nd); return nd; });
+      setTela("inicio");
+    } else if (result.tipo === "consulta") {
+      setTela("estoque");
+    } else if (result.tipo === "relatorio") {
+      setTela("relatorios");
+    }
+  }, []);
+
+  const navItems = [
+    { id: "inicio", icon: "🏠", label: "Início" },
+    { id: "estoque", icon: "📦", label: "Estoque" },
+    { id: "entrada", icon: "📥", label: "Entrada" },
+    { id: "venda", icon: "💰", label: "Venda" },
+    { id: "clientes", icon: "👥", label: "Clientes" },
+    { id: "relatorios", icon: "📊", label: "Relatórios" },
+    { id: "config", icon: "⚙️", label: "Config" },
+  ];
+
+  const telaLabels = { inicio: "AreiaControl", estoque: "Estoque", entrada: "Nova Entrada", venda: "Nova Venda", clientes: "Clientes", relatorios: "Relatórios", config: "Configurações" };
+
+  return (
+    <div style={S.app}>
+      <style>{`@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }`}</style>
+
+      <div style={S.header}>
+        <div>
+          <div style={S.headerTitle}>{telaLabels[tela]}</div>
+          {tela === "inicio" && <div style={S.headerSub}>Controle de Estoque</div>}
+        </div>
+        <button style={{ ...S.voiceBtn }} onClick={() => setVoiceOpen(true)}>
+          🎤 Voz
+        </button>
+      </div>
+
+      {tela === "inicio" && <TelaInicio data={data} />}
+      {tela === "estoque" && <TelaEstoque data={data} />}
+      {tela === "entrada" && <TelaEntrada data={data} setData={setData} />}
+      {tela === "venda" && <TelaVenda data={data} setData={setData} />}
+      {tela === "clientes" && <TelaClientes data={data} setData={setData} />}
+      {tela === "relatorios" && <TelaRelatorios data={data} />}
+      {tela === "config" && <TelaConfig data={data} setData={setData} />}
+
+      {voiceOpen && <VoiceModal onClose={() => setVoiceOpen(false)} data={data} onConfirm={handleVoiceConfirm} />}
+
+      <nav style={S.nav}>
+        {navItems.map(item => (
+          <button key={item.id} style={{ ...S.navBtn, ...(tela === item.id ? S.navBtnActive : {}) }} onClick={() => setTela(item.id)}>
+            <span style={{ fontSize: 16 }}>{item.icon}</span>
+            {item.label}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
